@@ -1,0 +1,2447 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>派車調度台</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ---------- localStorage-backed replacement for the Claude-artifact
+   window.storage API, so the persistence logic below needs no changes ---------- */
+window.storage = {
+  get: async (key) => {
+    const v = window.localStorage.getItem(key);
+    if (v === null) throw new Error("not found");
+    return { key, value: v };
+  },
+  set: async (key, value) => {
+    window.localStorage.setItem(key, value);
+    return { key, value };
+  },
+  delete: async (key) => {
+    window.localStorage.removeItem(key);
+    return { key, deleted: true };
+  },
+  list: async (prefix) => {
+    const keys = Object.keys(window.localStorage).filter((k) => !prefix || k.startsWith(prefix));
+    return { keys };
+  },
+};
+
+/* ---------- minimal inline icon set (replaces lucide-react, which needs
+   a bundler) — same line-icon visual language, no external dependency ---------- */
+function Icon({ children, size = 16, className, style }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+      className={className} style={style}>
+      {children}
+    </svg>
+  );
+}
+const FileEdit = (p) => <Icon {...p}><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></Icon>;
+const Download = (p) => <Icon {...p}><path d="M12 3v12"/><path d="m7 11 5 4 5-4"/><path d="M5 21h14"/></Icon>;
+const ImageIcon = (p) => <Icon {...p}><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></Icon>;
+const Trash2 = (p) => <Icon {...p}><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></Icon>;
+const ChevronRight = (p) => <Icon {...p}><path d="m9 18 6-6-6-6"/></Icon>;
+const Car = (p) => <Icon {...p}><path d="M14 16H9m10 0h3v-3.15a1 1 0 0 0-.84-.99L16 11l-2.7-3.6a2 2 0 0 0-1.6-.8H5.24a2 2 0 0 0-1.8 1.1l-1.5 3A2 2 0 0 0 1.9 12v4a1 1 0 0 0 1 1h1"/><circle cx="7" cy="16" r="2"/><circle cx="16" cy="16" r="2"/></Icon>;
+const Loader2 = (p) => <Icon {...p}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></Icon>;
+const AlertCircle = (p) => <Icon {...p}><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></Icon>;
+const CheckCircle2 = (p) => <Icon {...p}><path d="M21.801 10A10 10 0 1 1 17 3.335"/><path d="m9 11 3 3L22 4"/></Icon>;
+const History = (p) => <Icon {...p}><path d="M3 12a9 9 0 1 0 2.64-6.36L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></Icon>;
+const X = (p) => <Icon {...p}><path d="M18 6 6 18"/><path d="m6 6 12 12"/></Icon>;
+const Sparkles = (p) => <Icon {...p}><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/></Icon>;
+
+
+const STORAGE_KEY = "dispatch-tickets-v1";
+
+const CAR_TYPES = ["轎車", "休旅車", "商務車", "廂型車", "巴士", "其他"];
+
+const AIRPORT_OPTIONS = [
+  "桃園國際機場第一航廈",
+  "桃園國際機場第二航廈",
+  "臺北松山機場",
+  "高雄國際機場",
+  "台中國際機場",
+];
+
+const CAR_COLORS = ["白", "黑", "銀", "灰", "藍", "深藍", "紅", "綠", "黃", "棕", "香檳金", "卡其"];
+
+const CAR_MODELS = [
+  "Toyota Camry",
+  "Toyota Corolla Cross",
+  "Toyota RAV4",
+  "Hyundai Tucson",
+  "Kia Sportage",
+  "Tesla Model Y",
+  "Tesla Model X",
+  "Toyota Wish",
+  "Toyota Sienta",
+  "Toyota Sienna",
+  "Volkswagen Caddy",
+  "Kia Carnival",
+  "Hyundai Custin",
+  "Hyundai Santa Fe",
+  "Mercedes-Benz Vito",
+  "Mercedes-Benz V-Class",
+  "Volkswagen Caravelle T6",
+  "Hyundai Staria",
+  "Toyota Granvia",
+  "Lexus LM",
+  "Toyota Alphard",
+  "Mercedes-Benz E-Class",
+  "Mercedes-Benz S-Class",
+  "BMW 5 Series",
+  "BMW 7 Series",
+  "Lexus ES",
+  "Tesla Model 3",
+  "Tesla Model S",
+  "Luxgen n⁷",
+];
+
+const QTY_OPTIONS = ["", "0", "1", "2", "3", "4", "5", "6"];
+
+const LUGGAGE_SIZES = ["登機箱", "20吋", "22吋", "24吋", "26吋", "28吋", "29吋", "30吋", "32吋"];
+
+function parseLuggageSizeString(str) {
+  const map = {};
+  if (!str) return map;
+  String(str)
+    .split(/[、,，]/)
+    .forEach((part) => {
+      const trimmed = part.trim();
+      if (!trimmed) return;
+      const m = trimmed.match(/^(.+?)\s*[xX×]\s*(\d+)$/);
+      if (m) {
+        map[m[1].trim()] = parseInt(m[2], 10);
+      } else {
+        map[trimmed] = (map[trimmed] || 0) + 1;
+      }
+    });
+  return map;
+}
+
+function serializeLuggageSizeMap(map) {
+  return Object.entries(map)
+    .filter(([, qty]) => qty > 0)
+    .map(([size, qty]) => `${size} x${qty}`)
+    .join("、");
+}
+
+const STATUS_OPTIONS = ["待確認", "已指派司機", "已更換司機", "已完成", "已取消"];
+const STATUS_META = {
+  "待確認": { color: "#E8A33D", en: "PENDING" },
+  "已指派司機": { color: "#2F6FED", en: "ASSIGNED" },
+  "已更換司機": { color: "#8A5CF6", en: "DRIVER CHANGED" },
+  "已完成": { color: "#1F8A70", en: "COMPLETED" },
+  "已取消": { color: "#B3261E", en: "CANCELLED" },
+};
+
+const emptyForm = {
+  customSeq: "",
+  customerName: "",
+  phone: "",
+  pickup: "",
+  waypoint: "",
+  dropoff: "",
+  date: "",
+  time: "",
+  flightNo: "",
+  passengers: "",
+  carType: "",
+  carModel: "",
+  carColor: "",
+  driver: "",
+  driverPhone: "",
+  plate: "",
+  luggageCount: "",
+  luggageSize: "",
+  boosterSeat: "",
+  childSeat: "",
+  receipt: "",
+  price: "",
+  notes: "",
+};
+
+function pad(n, len) {
+  return String(n).padStart(len, "0");
+}
+
+function generateOrderNumber(date) {
+  const d = date || new Date();
+  const datePart = `${d.getFullYear()}${pad(d.getMonth() + 1, 2)}${pad(d.getDate(), 2)}`;
+  const timePart = `${pad(d.getHours(), 2)}${pad(d.getMinutes(), 2)}${pad(d.getSeconds(), 2)}`;
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let rand = "";
+  for (let i = 0; i < 4; i++) rand += chars[Math.floor(Math.random() * chars.length)];
+  return `DC-${datePart}-${timePart}-${rand}`;
+}
+
+function fmtDateTime(iso) {
+  const d = new Date(iso);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1, 2)}-${pad(d.getDate(), 2)} ${pad(
+    d.getHours(),
+    2
+  )}:${pad(d.getMinutes(), 2)}`;
+}
+
+function isValidPhone(phone) {
+  const digits = String(phone || "").replace(/[-\s]/g, "");
+  // Taiwan mobile (09xxxxxxxx, 10 digits) or landline (0x-xxxxxxx, 9-10 digits total).
+  return /^0\d{8,9}$/.test(digits);
+}
+
+function isPastDate(dateStr) {
+  if (!dateStr) return false;
+  const today = new Date();
+  const todayISO = `${today.getFullYear()}-${pad(today.getMonth() + 1, 2)}-${pad(today.getDate(), 2)}`;
+  return dateStr < todayISO;
+}
+
+function isLikelyValidPlate(plate) {
+  if (!plate || !plate.trim()) return true; // optional field, empty is fine
+  const compact = plate.replace(/[-\s]/g, "");
+  return /^[A-Za-z0-9]{5,8}$/.test(compact) && /[A-Za-z]/.test(compact) && /[0-9]/.test(compact);
+}
+
+function wrapText(ctx, text, x, y, maxWidth, lineHeight, maxLines) {
+  const chars = String(text).split("");
+  let line = "";
+  let lines = 0;
+  let curY = y;
+  for (let i = 0; i < chars.length; i++) {
+    const test = line + chars[i];
+    if (ctx.measureText(test).width > maxWidth && line !== "") {
+      ctx.fillText(line, x, curY);
+      line = chars[i];
+      curY += lineHeight;
+      lines += 1;
+      if (maxLines && lines >= maxLines - 1) {
+        const rest = chars.slice(i + 1).join("");
+        line = line + (rest ? "…" : "");
+        break;
+      }
+    } else {
+      line = test;
+    }
+  }
+  ctx.fillText(line, x, curY);
+  return curY;
+}
+
+async function drawTicketCanvas(order) {
+  const SCALE = 3; // higher render resolution for crisper, print-quality text
+  const W = 700;
+  const H = 940;
+  const canvas = document.createElement("canvas");
+  canvas.width = W * SCALE;
+  canvas.height = H * SCALE;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(SCALE, SCALE);
+  ctx.textRendering = "optimizeLegibility";
+
+  const NAVY = "#101B2D";
+  const WHITE = "#FFFFFF";
+  const AMBER = "#E8A33D";
+  const TEAL = "#1F8A70";
+  const SLATE = "#5B6B84";
+  const GRAPHITE = "#1B2436";
+
+  try {
+    await Promise.all([
+      document.fonts.load('700 30px "JetBrains Mono"'),
+      document.fonts.load('700 19px "JetBrains Mono"'),
+      document.fonts.load('600 12px "Noto Sans TC"'),
+      document.fonts.load('700 19px "Noto Sans TC"'),
+      document.fonts.load('700 30px "Noto Sans TC"'),
+      document.fonts.load('400 15px "Noto Sans TC"'),
+    ]);
+  } catch (e) {
+    /* fall back silently */
+  }
+
+  // base
+  ctx.fillStyle = WHITE;
+  ctx.fillRect(0, 0, W, H);
+
+  // stub
+  ctx.fillStyle = NAVY;
+  ctx.fillRect(0, 0, 140, H);
+
+  // vertical label on stub
+  ctx.save();
+  ctx.translate(28, H - 40);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.font = '600 13px "Noto Sans TC", sans-serif';
+  ctx.textBaseline = "middle";
+  ctx.fillText("D I S P A T C H   T I C K E T   派 車 調 度 單", 0, 0);
+  ctx.restore();
+
+  // order number on stub — drawn as genuinely rotated vertical text
+  // (matching the on-screen preview's `writing-mode: vertical-rl`),
+  // rather than horizontal lines stacked on top of each other. The last
+  // hyphen-separated segment (the random suffix, in this format) is
+  // highlighted in amber; works for any number of segments.
+  ctx.save();
+  ctx.translate(38, 58);
+  ctx.rotate(Math.PI / 2);
+  ctx.font = '700 24px "JetBrains Mono", monospace';
+  ctx.textBaseline = "alphabetic";
+  const lastDash = order.orderNumber.lastIndexOf("-");
+  const mainPart = lastDash !== -1 ? order.orderNumber.slice(0, lastDash + 1) : order.orderNumber;
+  const lastPart = lastDash !== -1 ? order.orderNumber.slice(lastDash + 1) : "";
+  ctx.fillStyle = WHITE;
+  ctx.fillText(mainPart, 0, 0);
+  const mainWidth = ctx.measureText(mainPart).width;
+  ctx.fillStyle = AMBER;
+  ctx.fillText(lastPart, mainWidth, 0);
+  ctx.restore();
+
+
+  // seal
+  ctx.beginPath();
+  ctx.arc(70, H - 90, 34, 0, Math.PI * 2);
+  ctx.fillStyle = AMBER;
+  ctx.fill();
+  ctx.fillStyle = NAVY;
+  ctx.font = '700 26px "Noto Sans TC", sans-serif';
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("派", 70, H - 89);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+
+  // perforation tear line
+  ctx.strokeStyle = "rgba(255,255,255,0.6)";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 7]);
+  ctx.beginPath();
+  ctx.moveTo(140, 0);
+  ctx.lineTo(140, H);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const LX = 182;
+  const RX = 670;
+  const colW = (RX - LX) / 2;
+
+  // header
+  ctx.fillStyle = GRAPHITE;
+  ctx.font = '700 30px "Noto Sans TC", sans-serif';
+  ctx.fillText("接送派車單", LX, 62);
+
+  ctx.fillStyle = SLATE;
+  ctx.font = '600 13px "JetBrains Mono", monospace';
+  ctx.textAlign = "right";
+  ctx.fillText("CAR DISPATCH ORDER", RX, 56);
+  ctx.textAlign = "left";
+
+  ctx.strokeStyle = "#D7DBE2";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(LX, 84);
+  ctx.lineTo(RX, 84);
+  ctx.stroke();
+
+  // field helpers — bold, high-contrast, tightly spaced for a compact,
+  // ticket-sized layout that mirrors the on-screen preview card.
+  function label(text, x, y) {
+    ctx.fillStyle = SLATE;
+    ctx.font = '600 12px "Noto Sans TC", sans-serif';
+    ctx.fillText(text, x, y);
+  }
+  function value(text, x, y, mono = false) {
+    ctx.fillStyle = GRAPHITE;
+    ctx.font = mono ? '700 19px "JetBrains Mono", monospace' : '700 19px "Noto Sans TC", sans-serif';
+    ctx.fillText(text || "-", x, y);
+  }
+
+  let y = 118;
+  label("客戶姓名", LX, y);
+  label("聯絡電話", LX + colW, y);
+  y += 22;
+  value(order.customerName, LX, y);
+  value(order.phone, LX + colW, y, true);
+
+  y += 40;
+  label("行程", LX, y);
+  y += 24;
+  ctx.font = '700 20px "Noto Sans TC", sans-serif';
+  const routeStops = [order.pickup || "-", order.waypoint, order.dropoff || "-"].filter(Boolean);
+  const routeTokens = [];
+  routeStops.forEach((stop, i) => {
+    for (const ch of stop) routeTokens.push({ ch, color: GRAPHITE });
+    if (i < routeStops.length - 1) {
+      for (const ch of " → ") routeTokens.push({ ch, color: AMBER });
+    }
+  });
+  const routeMaxWidth = RX - LX;
+  const routeLineHeight = 26;
+  let routeX = LX;
+  let routeY = y;
+  routeTokens.forEach((t) => {
+    const w = ctx.measureText(t.ch).width;
+    if (routeX + w > LX + routeMaxWidth && routeX > LX) {
+      routeY += routeLineHeight;
+      routeX = LX;
+    }
+    ctx.fillStyle = t.color;
+    ctx.fillText(t.ch, routeX, routeY);
+    routeX += w;
+  });
+  y = routeY;
+
+  y += 38;
+  label("用車日期", LX, y);
+  label("用車時間", LX + colW, y);
+  y += 22;
+  value(order.date, LX, y, true);
+  value(order.time, LX + colW, y, true);
+
+  const hasQty = (v) => v && v !== "0";
+  const hasVal = (v) => v != null && v !== "";
+
+  y += 40;
+  label("航班編號", LX, y);
+  label("搭乘人數", LX + colW, y);
+  y += 22;
+  value(order.flightNo, LX, y, true);
+  value(order.passengers ? `${order.passengers} 人` : "", LX + colW, y);
+
+  y += 40;
+  label("行李數量", LX, y);
+  label("行李尺寸", LX + colW, y);
+  y += 22;
+  value(hasQty(order.luggageCount) ? `${order.luggageCount} 件` : "", LX, y);
+  value(order.luggageSize, LX + colW, y);
+
+  y += 40;
+  label("增高墊", LX, y);
+  label("安全椅", LX + colW, y);
+  y += 22;
+  value(hasQty(order.boosterSeat) ? `${order.boosterSeat} 個` : "", LX, y);
+  value(hasQty(order.childSeat) ? `${order.childSeat} 個` : "", LX + colW, y);
+
+  y += 40;
+  label("收據", LX, y);
+  label("費用", LX + colW, y);
+  y += 22;
+  value(hasQty(order.receipt) ? `${order.receipt} 份` : "", LX, y);
+  value(hasVal(order.price) ? `NT$ ${order.price}` : "", LX + colW, y, true);
+
+  y += 40;
+  label("司機", LX, y);
+  label("司機電話", LX + colW, y);
+  y += 22;
+  value(order.driver || "待指派", LX, y);
+  value(order.driverPhone, LX + colW, y, true);
+
+  y += 40;
+  label("車型", LX, y);
+  label("車款", LX + colW, y);
+  y += 22;
+  value(order.carType, LX, y);
+  value(order.carModel, LX + colW, y);
+
+  y += 40;
+  label("車號", LX, y);
+  label("車色", LX + colW, y);
+  y += 22;
+  value(order.plate || "待指派", LX, y, true);
+  value(order.carColor, LX + colW, y);
+
+  y += 34;
+  ctx.strokeStyle = "#E4E7EC";
+  ctx.beginPath();
+  ctx.moveTo(LX, y);
+  ctx.lineTo(RX, y);
+  ctx.stroke();
+
+  y += 24;
+  label("備註", LX, y);
+  y += 22;
+  ctx.fillStyle = GRAPHITE;
+  ctx.font = '400 15px "Noto Sans TC", sans-serif';
+  wrapText(ctx, order.notes || "無", LX, y, RX - LX - 160, 20, 3);
+
+  // footer
+  ctx.fillStyle = SLATE;
+  ctx.font = '400 12px "JetBrains Mono", monospace';
+  ctx.fillText(`建立時間 ${fmtDateTime(order.createdAt)}`, LX, H - 24);
+
+  // status badge
+  const statusText = order.status || "待確認";
+  const statusMeta = STATUS_META[statusText] || STATUS_META["待確認"];
+  const badgeText = `${statusText} ${statusMeta.en}`;
+  ctx.font = '700 12px "JetBrains Mono", monospace';
+  const bw = ctx.measureText(badgeText).width + 26;
+  ctx.fillStyle = statusMeta.color;
+  const bx = RX - bw;
+  const by = H - 40;
+  const bh = 26;
+  const r = 13;
+  ctx.beginPath();
+  ctx.moveTo(bx + r, by);
+  ctx.arcTo(bx + bw, by, bx + bw, by + bh, r);
+  ctx.arcTo(bx + bw, by + bh, bx, by + bh, r);
+  ctx.arcTo(bx, by + bh, bx, by, r);
+  ctx.arcTo(bx, by, bx + bw, by, r);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = WHITE;
+  ctx.fillText(badgeText, bx + 14, by + 20);
+
+  return canvas;
+}
+
+// ---- export helpers: Blob-based, cross-platform (Chrome / Safari / Edge / Android / iPhone / iPad) ----
+
+function canvasToBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("無法產生圖片 Blob"));
+    }, "image/png");
+  });
+}
+
+// For the on-screen preview <img> only (not for saving/sharing). Some
+// browsers fail to paint blob: object URLs — showing a blank white box
+// with no error — when the page is opened via file:// or inside certain
+// in-app WebViews. Reading the blob back out as a data URL sidesteps
+// that and always renders.
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("無法讀取圖片內容"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Returns true on success, "cancelled" if the user dismissed the share
+// sheet without picking anything, or false if the Web Share API for
+// files isn't available/usable here (caller should fall back).
+async function shareFile(file) {
+  if (!navigator.share || !navigator.canShare || !navigator.canShare({ files: [file] })) {
+    return false;
+  }
+  try {
+    await navigator.share({ files: [file], title: file.name });
+    return true;
+  } catch (err) {
+    if (err && err.name === "AbortError") return "cancelled";
+    console.warn("navigator.share failed", err);
+    return false;
+  }
+}
+
+function OptionalRow({ label1, val1, label2, val2, mono1, mono2 }) {
+  const has1 = !!val1;
+  const has2 = !!val2;
+  if (!has1 && !has2) return null;
+  if (has1 && has2) {
+    return (
+      <div className="t-row">
+        <div>
+          <div className="t-label">{label1}</div>
+          <div className={"t-val" + (mono1 ? " mono" : "")}>{val1}</div>
+        </div>
+        <div>
+          <div className="t-label">{label2}</div>
+          <div className={"t-val" + (mono2 ? " mono" : "")}>{val2}</div>
+        </div>
+      </div>
+    );
+  }
+  const label = has1 ? label1 : label2;
+  const val = has1 ? val1 : val2;
+  const mono = has1 ? mono1 : mono2;
+  return (
+    <div>
+      <div className="t-label">{label}</div>
+      <div className={"t-val" + (mono ? " mono" : "")}>{val}</div>
+    </div>
+  );
+}
+
+function DispatchOrderApp() {
+  const [form, setForm] = useState(emptyForm);
+  const [formError, setFormError] = useState("");
+  const [currentOrder, setCurrentOrder] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [dataLoaded, setDataLoaded] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [exportImage, setExportImage] = useState(null);
+  const [exportLoading, setExportLoading] = useState(false);
+  const [editingOrderNumber, setEditingOrderNumber] = useState(null);
+  const [conflictInfo, setConflictInfo] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [aiDialogOpen, setAiDialogOpen] = useState(false);
+  const [aiText, setAiText] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState("");
+  const [aiDebug, setAiDebug] = useState("");
+  const [aiConfidence, setAiConfidence] = useState({});
+  const [pendingAIData, setPendingAIData] = useState(null);
+  const previewRef = useRef(null);
+
+  useEffect(() => {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href =
+      "https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap";
+    document.head.appendChild(link);
+    return () => {
+      document.head.removeChild(link);
+    };
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, false);
+        if (res && res.value) {
+          const data = JSON.parse(res.value);
+          setHistory(data.orders || []);
+        }
+      } catch (e) {
+        // no data yet
+      } finally {
+        setDataLoaded(true);
+      }
+    })();
+  }, []);
+
+  async function persist(nextOrders) {
+    const payload = JSON.stringify({ orders: nextOrders });
+    try {
+      await window.storage.set(STORAGE_KEY, payload, false);
+    } catch (e) {
+      console.error("storage save failed", e);
+    }
+  }
+
+  function updateField(key, val) {
+    setForm((f) => ({ ...f, [key]: val }));
+  }
+
+  function updateLuggageSizeQty(size, delta) {
+    const map = parseLuggageSizeString(form.luggageSize);
+    const next = Math.max(0, (map[size] || 0) + delta);
+    if (next === 0) delete map[size];
+    else map[size] = next;
+    updateField("luggageSize", serializeLuggageSizeMap(map));
+  }
+
+  const AI_FIELD_KEYS = [
+    "customerName", "phone", "pickup", "waypoint", "dropoff", "date", "time", "flightNo",
+    "passengers", "carType", "carModel", "carColor", "driver", "driverPhone", "plate",
+    "luggageCount", "luggageSize", "boosterSeat", "childSeat", "receipt", "price", "notes",
+  ];
+
+  function formHasData() {
+    return AI_FIELD_KEYS.some((k) => form[k] && String(form[k]).trim() !== "");
+  }
+
+  function todayISO() {
+    const d = new Date();
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1, 2)}-${pad(d.getDate(), 2)}`;
+  }
+
+  async function callClaudeParse(text, correction) {
+    const prompt = `你是專業的派車調度助理。請閱讀以下客戶訊息（可能是LINE對話、Email或口語敘述），萃取欄位並「只回傳一個JSON物件」，不要有任何說明文字、不要使用markdown code fence、不要加註解。
+
+每個欄位請輸出 {"value": ..., "confidence": 0~1之間的數字}。若某欄位訊息中沒有提到，value 請填空字串 ""，confidence 請填 0。
+
+日期請轉換為 YYYY-MM-DD 格式，時間請轉換為 24小時制 HH:mm 格式；若客戶使用「明天」、「後天」等相對日期，請以今天日期 ${todayISO()} 為基準推算。車型（carType）請從「轎車、休旅車、商務車、廂型車、巴士」中選擇最接近的一項，若無法判斷則留空。若有提到具體車款（如 Toyota Alphard），請填入 carModel。若有提到司機或司機電話，請分別填入 driver、driverPhone。若有提到行李件數，請填入 luggageCount（純數字文字）；若有提到行李尺寸，請填入 luggageSize。
+
+你必須具備容錯與推論能力，例如「桃機二航」代表「桃園機場第二航廈」、「四位」代表 passengers="4"、「下午三點左右」代表 time="15:00"、「長榮BR156」代表 flightNo="BR156"。
+
+JSON schema（請照此鍵名輸出，不可增加或減少欄位）：
+{"customerName":{"value":"","confidence":0},"phone":{"value":"","confidence":0},"pickup":{"value":"","confidence":0},"dropoff":{"value":"","confidence":0},"date":{"value":"","confidence":0},"time":{"value":"","confidence":0},"flightNo":{"value":"","confidence":0},"passengers":{"value":"","confidence":0},"carType":{"value":"","confidence":0},"carModel":{"value":"","confidence":0},"driver":{"value":"","confidence":0},"driverPhone":{"value":"","confidence":0},"plate":{"value":"","confidence":0},"luggageCount":{"value":"","confidence":0},"luggageSize":{"value":"","confidence":0},"notes":{"value":"","confidence":0}}
+
+客戶訊息：
+"""
+${text}
+"""${correction ? "\n\n[系統提醒] 你上一次的輸出不是合法的 JSON，請重新輸出，只能輸出一個符合上述 schema 的 JSON 物件，不能有任何其他文字。" : ""}`;
+
+    setAiDebug("[status] calling fetch()...");
+    let response;
+    try {
+      response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 1500,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+    } catch (fetchErr) {
+      setAiDebug(
+        `[fetch() itself threw]\nname: ${fetchErr && fetchErr.name}\nmessage: ${fetchErr && fetchErr.message}\nstack: ${fetchErr && fetchErr.stack}`
+      );
+      throw new Error(`fetch 失敗：${(fetchErr && fetchErr.message) || "未知錯誤"}`);
+    }
+
+    setAiDebug(`[status] got response, status=${response.status} ok=${response.ok}`);
+
+    let data;
+    let rawText = "";
+    try {
+      rawText = await response.text();
+      data = JSON.parse(rawText);
+    } catch (e) {
+      setAiDebug(`[response body was not valid JSON]\nstatus: ${response.status}\nraw text:\n${rawText}`);
+      throw new Error("伺服器回應格式異常，請稍後再試");
+    }
+    console.log("AI Raw Response object:", data);
+    setAiDebug(`[raw response]\n${JSON.stringify(data, null, 2)}`);
+    if (!response.ok) {
+      const msg = (data && data.error && data.error.message) || "未知錯誤";
+      throw new Error(`${msg}（HTTP ${response.status}）`);
+    }
+    if (data && data.error) {
+      throw new Error(data.error.message || "AI 服務回傳錯誤");
+    }
+    const textBlock = (data.content || []).find((c) => c.type === "text");
+    if (!textBlock || !textBlock.text) throw new Error("AI 未回傳文字內容，請重試一次");
+
+    let cleaned = textBlock.text.trim();
+    cleaned = cleaned.replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
+    const firstBrace = cleaned.indexOf("{");
+    const lastBrace = cleaned.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+    }
+    console.log("AI Raw Response text (cleaned):", cleaned);
+    setAiDebug((prev) => `${prev}\n\n[cleaned text]\n${cleaned}`);
+    return JSON.parse(cleaned);
+  }
+
+  function cnToNumber(raw) {
+    if (raw == null) return null;
+    const str = String(raw).trim();
+    if (/^\d+$/.test(str)) return parseInt(str, 10);
+    const map = { "零": 0, "一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10 };
+    if (str.length === 1) return map[str] != null ? map[str] : null;
+    if (str.length === 2 && str[0] === "十") return 10 + (map[str[1]] || 0);
+    if (str.length === 2 && str[1] === "十") return (map[str[0]] || 0) * 10;
+    if (str.length === 3 && str[1] === "十") return (map[str[0]] || 0) * 10 + (map[str[2]] || 0);
+    return null;
+  }
+
+  const KNOWN_PLACES = [
+    { names: ["桃園機場第一航廈", "桃機一航", "桃園機場一航"], canonical: "桃園機場第一航廈" },
+    { names: ["桃園機場第二航廈", "桃機二航", "桃園機場二航"], canonical: "桃園機場第二航廈" },
+    { names: ["松山機場", "松機"], canonical: "松山機場" },
+    { names: ["高鐵台中站", "台中高鐵"], canonical: "高鐵台中站" },
+    { names: ["高雄左營站", "左營高鐵"], canonical: "高雄左營站" },
+    { names: ["台北車站"], canonical: "台北車站" },
+    { names: ["台北君悅", "君悅酒店", "君悅"], canonical: "台北君悅酒店" },
+    { names: ["台北萬豪", "萬豪酒店"], canonical: "台北萬豪酒店" },
+    { names: ["台中林酒店"], canonical: "台中林酒店" },
+    { names: ["高雄漢來"], canonical: "高雄漢來大飯店" },
+    { names: ["台南晶英"], canonical: "台南晶英酒店" },
+    { names: ["W Hotel", "W飯店"], canonical: "W Hotel" },
+  ];
+
+  function findPlaces(text) {
+    const hits = [];
+    for (const place of KNOWN_PLACES) {
+      for (const alias of place.names) {
+        const idx = text.indexOf(alias);
+        if (idx !== -1) {
+          hits.push({ index: idx, canonical: place.canonical });
+          break;
+        }
+      }
+    }
+    hits.sort((a, b) => a.index - b.index);
+    return hits;
+  }
+
+  function normalizeDateValue(raw) {
+    if (!raw) return "";
+    const s = raw.trim();
+    const relDate = s.match(/(今天|明天|後天)/);
+    const isoDate = s.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+    const cnDate = s.match(/(\d{1,2})月(\d{1,2})[日號]/);
+    const slashDate = s.match(/(\d{1,2})\/(\d{1,2})(?!\d)/);
+    if (relDate) {
+      const offset = relDate[1] === "今天" ? 0 : relDate[1] === "明天" ? 1 : 2;
+      const d = new Date();
+      d.setDate(d.getDate() + offset);
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1, 2)}-${pad(d.getDate(), 2)}`;
+    }
+    if (isoDate) return `${isoDate[1]}-${pad(Number(isoDate[2]), 2)}-${pad(Number(isoDate[3]), 2)}`;
+    if (cnDate) {
+      const year = new Date().getFullYear();
+      return `${year}-${pad(Number(cnDate[1]), 2)}-${pad(Number(cnDate[2]), 2)}`;
+    }
+    if (slashDate) {
+      const year = new Date().getFullYear();
+      return `${year}-${pad(Number(slashDate[1]), 2)}-${pad(Number(slashDate[2]), 2)}`;
+    }
+    return "";
+  }
+
+  function normalizeTimeValue(raw) {
+    if (!raw) return "";
+    const s = raw.trim();
+    const clockTime = s.match(/(上午|下午)?\s*(\d{1,2})[:：](\d{2})/);
+    const wordTime = s.match(/(上午|下午)?\s*(\d{1,2})\s*點\s*(半)?/);
+    if (clockTime) {
+      let h = Number(clockTime[2]);
+      const m = clockTime[3];
+      if (clockTime[1] === "下午" && h < 12) h += 12;
+      if (clockTime[1] === "上午" && h === 12) h = 0;
+      return `${pad(h, 2)}:${m}`;
+    }
+    if (wordTime) {
+      let h = Number(wordTime[2]);
+      if (wordTime[1] === "下午" && h < 12) h += 12;
+      if (wordTime[1] === "上午" && h === 12) h = 0;
+      const m = wordTime[3] ? "30" : "00";
+      return `${pad(h, 2)}:${m}`;
+    }
+    return "";
+  }
+
+  // Detects the fixed "機場派車單" fill-in-the-blank template (labels
+  // followed by a full-width or half-width colon, one per line). When the
+  // pasted text matches this template, parsing by label is far more
+  // reliable than the free-text heuristics in localParse(), since the
+  // customer/staff already did the work of labeling each field.
+  function isStructuredTemplate(text) {
+    const markers = ["乘客姓名", "機場派車單", "班機", "增高墊", "安全椅"];
+    const hits = markers.filter((m) => text.includes(m)).length;
+    return hits >= 2;
+  }
+
+  function parseStructuredTemplate(text) {
+    const result = {};
+    const setField = (key, value, confidence = 0.97) => {
+      if (result[key] && result[key].value) return; // first occurrence wins (e.g. repeated 電話 handled separately)
+      result[key] = { value: value || "", confidence: value ? confidence : 0 };
+    };
+
+    const LABEL_MAP = {
+      "乘客姓名": "customerName",
+      "姓名": "customerName",
+      "日期": "date",
+      "時間": "time",
+      "上車": "pickup",
+      "中途": "waypoint",
+      "下車": "dropoff",
+      "人數": "passengers",
+      "行李": "luggageCount",
+      "尺寸": "luggageSize",
+      "班機": "flightNo",
+      "增高墊": "boosterSeat",
+      "安全椅": "childSeat",
+      "收據": "receipt",
+      "費用": "price",
+      "價格": "price",
+      "車資": "price",
+      "駕駛": "driver",
+      "車型": "carType",
+      "車色": "carColor",
+      "車牌": "plate",
+    };
+
+    let afterDriver = false;
+    const lines = text.split(/\r?\n/);
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const m = line.match(/^([^\s:：]+?)[（(]?\s*[:：]\s*(.*)$/);
+      if (!m) continue;
+      let label = m[1].replace(/[（(]必填[）)]?/g, "").trim();
+      const value = m[2].trim();
+
+      if (label === "駕駛") afterDriver = true;
+
+      if (label === "電話") {
+        setField(afterDriver ? "driverPhone" : "phone", value.replace(/[-\s]/g, ""), 0.97);
+        continue;
+      }
+
+      const key = LABEL_MAP[label];
+      if (!key) continue;
+
+      if (key === "date") {
+        setField("date", normalizeDateValue(value) || value, 0.95);
+      } else if (key === "time") {
+        setField("time", normalizeTimeValue(value) || value, 0.95);
+      } else if (key === "passengers" || key === "luggageCount" || key === "boosterSeat" || key === "childSeat") {
+        const num = cnToNumber(value.replace(/[^0-9一二兩三四五六七八九十]/g, ""));
+        setField(key, num != null ? String(num) : value, 0.95);
+      } else if (key === "carType") {
+        if (CAR_TYPES.includes(value)) {
+          setField("carType", value, 0.97);
+        } else {
+          setField("carType", "");
+          if (value) setField("carModel", value, 0.8);
+        }
+      } else {
+        setField(key, value, 0.97);
+      }
+    }
+
+    for (const key of AI_FIELD_KEYS) {
+      if (!result[key]) result[key] = { value: "", confidence: 0 };
+    }
+    return result;
+  }
+
+  function localParse(text) {
+    const result = {};
+
+    const setField = (key, value, confidence = 1) => {
+      result[key] = {
+        value: value || "",
+        confidence: value ? confidence : 0,
+      };
+    };
+
+    // 電話（09開頭10碼，或 +886 開頭）
+    const phone = text.match(/(?:\+?886[-\s]?9|09)\d{2}[-\s]?\d{3}[-\s]?\d{3}/);
+    if (phone) {
+      let digits = phone[0].replace(/[-\s]/g, "");
+      digits = digits.replace(/^\+?886/, "0");
+      setField("phone", digits, 0.99);
+    } else {
+      setField("phone", "");
+    }
+
+    // 航班（可接受連字號，如 CI-123）
+    const flight = text.match(/[A-Z]{2}[\s-]?\d{2,4}/i);
+    setField("flightNo", flight ? flight[0].replace(/[\s-]/g, "").toUpperCase() : "", 0.95);
+
+    // 人數（阿拉伯數字或中文數字）
+    const p = text.match(/([0-9一二兩三四五六七八九十]+)\s*(位|人)/);
+    const pNum = p ? cnToNumber(p[1]) : null;
+    setField("passengers", pNum != null ? String(pNum) : "", 0.9);
+
+    // 行李（阿拉伯數字或中文數字）
+    const luggage = text.match(/([0-9一二兩三四五六七八九十]+)\s*(件|咖|箱|個)行李?/);
+    const lNum = luggage ? cnToNumber(luggage[1]) : null;
+    setField("luggageCount", lNum != null ? String(lNum) : "", 0.9);
+
+    // 日期：支援 7/22、2026-07-22、2026/7/22、7月22日、以及明天/後天/今天
+    let dateValue = "";
+    const relDate = text.match(/(今天|明天|後天)/);
+    const isoDate = text.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+    const cnDate = text.match(/(\d{1,2})月(\d{1,2})[日號]/);
+    const slashDate = text.match(/(\d{1,2})\/(\d{1,2})(?!\d)/);
+    if (relDate) {
+      const offset = relDate[1] === "今天" ? 0 : relDate[1] === "明天" ? 1 : 2;
+      const d = new Date();
+      d.setDate(d.getDate() + offset);
+      dateValue = `${d.getFullYear()}-${pad(d.getMonth() + 1, 2)}-${pad(d.getDate(), 2)}`;
+    } else if (isoDate) {
+      dateValue = `${isoDate[1]}-${pad(Number(isoDate[2]), 2)}-${pad(Number(isoDate[3]), 2)}`;
+    } else if (cnDate) {
+      const year = new Date().getFullYear();
+      dateValue = `${year}-${pad(Number(cnDate[1]), 2)}-${pad(Number(cnDate[2]), 2)}`;
+    } else if (slashDate) {
+      const year = new Date().getFullYear();
+      dateValue = `${year}-${pad(Number(slashDate[1]), 2)}-${pad(Number(slashDate[2]), 2)}`;
+    }
+    setField("date", dateValue, 0.9);
+
+    // 時間：優先抓明確的 HH:MM，其次抓「上午/下午 + 數字 + 點（半）」，避免誤抓電話號碼裡的數字
+    let timeValue = "";
+    const clockTime = text.match(/(上午|下午)?\s*(\d{1,2})[:：](\d{2})/);
+    const wordTime = text.match(/(上午|下午)\s*(\d{1,2})\s*點\s*(半)?/);
+    if (clockTime) {
+      let h = Number(clockTime[2]);
+      const m = clockTime[3];
+      if (clockTime[1] === "下午" && h < 12) h += 12;
+      if (clockTime[1] === "上午" && h === 12) h = 0;
+      timeValue = `${pad(h, 2)}:${m}`;
+    } else if (wordTime) {
+      let h = Number(wordTime[2]);
+      if (wordTime[1] === "下午" && h < 12) h += 12;
+      if (wordTime[1] === "上午" && h === 12) h = 0;
+      const m = wordTime[3] ? "30" : "00";
+      timeValue = `${pad(h, 2)}:${m}`;
+    }
+    setField("time", timeValue, 0.85);
+
+    // 上/下車地點：比對已知地點清單（機場航廈、飯店、車站），
+    // 用「從／到／送／去」等方向詞判斷哪個是上車、哪個是下車
+    const places = findPlaces(text);
+    if (places.length >= 2) {
+      setField("pickup", places[0].canonical, 0.85);
+      setField("dropoff", places[1].canonical, 0.85);
+    } else if (places.length === 1) {
+      const before = text.slice(Math.max(0, places[0].index - 3), places[0].index);
+      const isDropoff = /送到|送去|到|去/.test(before);
+      if (isDropoff) {
+        setField("pickup", "");
+        setField("dropoff", places[0].canonical, 0.75);
+      } else {
+        setField("pickup", places[0].canonical, 0.75);
+        setField("dropoff", "");
+      }
+    } else {
+      setField("pickup", "");
+      setField("dropoff", "");
+    }
+
+    // 姓名：優先抓「X先生/小姐/女士」，抓不到再退回常見姓氏比對
+    const titleName = text.match(/([\u4e00-\u9fa5]{1,3})(先生|小姐|女士)/);
+    const surnameName = text.match(/(王|李|陳|林|張|黃|吳|劉|蔡|楊|周|徐|孫|馬|郭|謝|許|鄭|曾|廖|賴|洪|周|葉|蘇|盧)[^\s，。]{1,2}/);
+    if (titleName) {
+      setField("customerName", titleName[0], 0.85);
+    } else if (surnameName) {
+      setField("customerName", surnameName[0], 0.6);
+    } else {
+      setField("customerName", "");
+    }
+
+    // 其餘欄位保持 schema
+    [
+      "waypoint",
+      "carType",
+      "carModel",
+      "carColor",
+      "driver",
+      "driverPhone",
+      "plate",
+      "luggageSize",
+      "boosterSeat",
+      "childSeat",
+      "receipt",
+      "price",
+      "notes",
+    ].forEach((k) => {
+      if (!result[k]) setField(k, "");
+    });
+
+    return result;
+  }
+
+  async function handleAIParse() {
+    if (!aiText.trim()) {
+      setAiError("請先貼上客戶訊息內容");
+      return;
+    }
+    setAiLoading(true);
+    setAiError("");
+    setAiDebug("");
+    try {
+      const parsed = isStructuredTemplate(aiText) ? parseStructuredTemplate(aiText) : localParse(aiText);
+
+      const confidence = {};
+      for (const key of AI_FIELD_KEYS) {
+        const field = parsed[key];
+        confidence[key] = field && typeof field.confidence === "number" ? field.confidence : 0;
+      }
+
+      if (formHasData()) {
+        setPendingAIData({ parsed, confidence });
+      } else {
+        applyAIData({ parsed, confidence }, "overwrite");
+      }
+      setAiDialogOpen(false);
+      setAiText("");
+    } catch (e) {
+      console.error(e);
+      setAiError((e && e.message) ? `AI 解析失敗：${e.message}` : "AI解析失敗，請重新嘗試。");
+    } finally {
+      setAiLoading(false);
+    }
+  }
+
+  function applyAIData(payload, strategy) {
+    const { parsed, confidence } = payload;
+    setForm((f) => {
+      const next = { ...f };
+      for (const key of AI_FIELD_KEYS) {
+        const field = parsed[key];
+        let value = field && field.value != null ? String(field.value) : "";
+        if (key === "carType" && value && !CAR_TYPES.includes(value)) {
+          // Not a recognized car type — keep whatever text it is as extra
+          // detail in carModel instead of leaving an invalid <select> value.
+          if (!parsed.carModel || !parsed.carModel.value) {
+            next.carModel = value;
+          }
+          value = "";
+        }
+        if (!value) continue;
+        if (strategy === "fillEmptyOnly" && next[key] && String(next[key]).trim() !== "") continue;
+        next[key] = value;
+      }
+      return next;
+    });
+    setAiConfidence(confidence || {});
+    setPendingAIData(null);
+  }
+
+  function lowConfidenceStyle(key) {
+    const c = aiConfidence[key];
+    if (typeof c !== "number" || c >= 0.8) return {};
+    return { borderColor: "#E8A33D", background: "#FFF8EC" };
+  }
+
+  function closeAIDialog() {
+    if (aiLoading) return;
+    setAiDialogOpen(false);
+    setAiText("");
+    setAiError("");
+  }
+
+  function findConflicts(candidate, excludeOrderNumber) {
+    if (!candidate.date || !candidate.time) return [];
+    return history.filter((o) => {
+      if (o.orderNumber === excludeOrderNumber) return false;
+      if (o.status === "已取消") return false;
+      if (o.date !== candidate.date || o.time !== candidate.time) return false;
+      const sameDriver = candidate.driver && o.driver && candidate.driver.trim() === o.driver.trim();
+      const samePlate = candidate.plate && o.plate && candidate.plate.trim() === o.plate.trim();
+      return sameDriver || samePlate;
+    });
+  }
+
+  async function handleSubmitOrder(forceSubmit = false) {
+    if (!dataLoaded) {
+      setFormError("資料載入中，請稍候一秒再試一次");
+      return;
+    }
+    if (!form.customerName || !form.phone || !form.pickup || !form.dropoff || !form.date || !form.time) {
+      setFormError("請填寫姓名、電話、上下車地點、日期與時間");
+      return;
+    }
+    if (!isValidPhone(form.phone)) {
+      setFormError("聯絡電話格式不正確，請確認（例如 0912345678 或 02-12345678）");
+      return;
+    }
+    setFormError("");
+
+    if (!forceSubmit) {
+      const conflicts = findConflicts(form, editingOrderNumber);
+      if (conflicts.length > 0) {
+        setConflictInfo({
+          orderNumbers: conflicts.map((o) => o.orderNumber),
+          driver: form.driver,
+          plate: form.plate,
+        });
+        return;
+      }
+    }
+    setConflictInfo(null);
+
+    if (editingOrderNumber) {
+      // Update existing order in place — keep its number, creation time, and status.
+      const nextOrders = history.map((o) => {
+        if (o.orderNumber !== editingOrderNumber) return o;
+        const log = Array.isArray(o.statusLog) ? o.statusLog : [];
+        const driverChanged = (o.driver || "") !== (form.driver || "") && form.driver;
+        const nextLog = driverChanged
+          ? [...log, { status: o.status, at: new Date().toISOString(), driver: form.driver, note: "指派司機" }]
+          : log;
+        return {
+          ...o,
+          ...form,
+          orderNumber: o.orderNumber,
+          createdAt: o.createdAt,
+          status: o.status,
+          statusLog: nextLog,
+          updatedAt: new Date().toISOString(),
+        };
+      });
+      setHistory(nextOrders);
+      const updated = nextOrders.find((o) => o.orderNumber === editingOrderNumber);
+      setCurrentOrder(updated);
+      setEditingOrderNumber(null);
+      setForm(emptyForm);
+      await persist(nextOrders);
+      return;
+    }
+
+    const now = new Date();
+    let orderNumber;
+    const customVal = (form.customSeq || "").trim();
+    if (customVal) {
+      if (history.some((o) => o.orderNumber === customVal)) {
+        setFormError(`訂單編號「${customVal}」已經被使用過，請換一個`);
+        return;
+      }
+      orderNumber = customVal;
+    } else {
+      orderNumber = generateOrderNumber(now);
+      // Astronomically unlikely to collide, but guard anyway.
+      let guard = 0;
+      while (history.some((o) => o.orderNumber === orderNumber) && guard < 5) {
+        orderNumber = generateOrderNumber(now);
+        guard += 1;
+      }
+    }
+    const { customSeq: _customSeq, ...formWithoutOverride } = form;
+    const newOrder = {
+      orderNumber,
+      createdAt: now.toISOString(),
+      status: "待確認",
+      statusLog: [{ status: "待確認", at: now.toISOString(), driver: form.driver || "" }],
+      ...formWithoutOverride,
+    };
+    const nextOrders = [newOrder, ...history].slice(0, 300);
+    setHistory(nextOrders);
+    setCurrentOrder(newOrder);
+    await persist(nextOrders);
+  }
+
+  function handleEditOrder(order) {
+    setForm({ ...emptyForm, ...order });
+    setEditingOrderNumber(order.orderNumber);
+    setConflictInfo(null);
+    setFormError("");
+    setCurrentOrder(order);
+  }
+
+  function handleCancelEdit() {
+    setEditingOrderNumber(null);
+    setForm(emptyForm);
+    setConflictInfo(null);
+    setFormError("");
+  }
+
+  async function updateOrderStatus(orderNumber, newStatus) {
+    const nextOrders = history.map((o) => {
+      if (o.orderNumber !== orderNumber) return o;
+      const log = Array.isArray(o.statusLog) ? o.statusLog : [];
+      return {
+        ...o,
+        status: newStatus,
+        statusLog: [...log, { status: newStatus, at: new Date().toISOString(), driver: o.driver || "" }],
+      };
+    });
+    setHistory(nextOrders);
+    if (currentOrder && currentOrder.orderNumber === orderNumber) {
+      setCurrentOrder(nextOrders.find((o) => o.orderNumber === orderNumber));
+    }
+    await persist(nextOrders);
+  }
+
+  function resetForm() {
+    setForm(emptyForm);
+    setCurrentOrder(null);
+    setFormError("");
+    setEditingOrderNumber(null);
+    setConflictInfo(null);
+  }
+
+  async function handleExport(order) {
+    setExportError("");
+    setExportLoading(true);
+    setExportImage(null);
+    try {
+      const canvas = await drawTicketCanvas(order);
+      const blob = await canvasToBlob(canvas);
+      const filename = `${order.orderNumber}.png`;
+      const file = new File([blob], filename, { type: "image/png" });
+
+      // Try the native share/save sheet first. Some in-app WebViews
+      // (e.g. the ChatGPT iOS app's browser) don't support `<a download>`
+      // at all, so Web Share is the primary save path, not a fallback.
+      const shareResult = await shareFile(file);
+      if (shareResult === true || shareResult === "cancelled") {
+        setExportLoading(false);
+        return;
+      }
+
+      // Web Share unavailable/failed: show the ticket inline so the user
+      // can save it manually, with a "儲存圖片" button that retries the
+      // share call from a fresh, guaranteed user gesture.
+      const previewUrl = await blobToDataURL(blob);
+      setExportImage({ url: previewUrl, orderNumber: order.orderNumber, file });
+    } catch (e) {
+      console.error("image export failed", e);
+      setExportError((e && e.message) || "圖片匯出失敗，請重新整理頁面後再試一次。");
+    } finally {
+      setExportLoading(false);
+    }
+  }
+
+  async function handleSaveImage() {
+    if (!exportImage || !exportImage.file) return;
+    setExportError("");
+    const result = await shareFile(exportImage.file);
+    if (result === false) {
+      setExportError("此瀏覽器不支援分享/儲存功能，請直接在圖片上長按（電腦請右鍵）選擇「儲存圖片」。");
+    }
+  }
+
+  async function handleDeleteHistory(orderNumber) {
+    const nextOrders = history.filter((o) => o.orderNumber !== orderNumber);
+    setHistory(nextOrders);
+    await persist(nextOrders);
+    if (currentOrder && currentOrder.orderNumber === orderNumber) {
+      setCurrentOrder(null);
+    }
+    if (editingOrderNumber === orderNumber) {
+      handleCancelEdit();
+    }
+  }
+
+  const previewOrder = currentOrder;
+
+  const filteredHistory = (() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return history;
+    return history.filter((o) => {
+      const haystack = [
+        o.customerName,
+        o.phone,
+        o.driver,
+        o.driverPhone,
+        o.plate,
+        o.pickup,
+        o.dropoff,
+        o.date,
+        o.orderNumber,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+  })();
+
+  return (
+    <div className="app-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+        * { box-sizing: border-box; }
+        .app-root {
+          min-height: 100vh;
+          background: #EEF0F3;
+          font-family: 'Noto Sans TC', sans-serif;
+          color: #1B2436;
+          padding: 28px 20px 60px;
+        }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+
+        .topbar {
+          max-width: 1180px;
+          margin: 0 auto 24px;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          flex-wrap: wrap;
+          gap: 12px;
+        }
+        .brand {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+        }
+        .brand-icon {
+          width: 42px; height: 42px;
+          border-radius: 10px;
+          background: #101B2D;
+          display: flex; align-items: center; justify-content: center;
+          color: #E8A33D;
+        }
+        .brand-title {
+          font-weight: 900;
+          font-size: 20px;
+          letter-spacing: 0.5px;
+        }
+        .brand-sub {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 11px;
+          color: #5B6B84;
+          letter-spacing: 1.5px;
+        }
+        .status-pill {
+          display: flex; align-items: center; gap: 8px;
+          background: #101B2D; color: #fff;
+          padding: 8px 14px; border-radius: 999px;
+          font-size: 12px; font-family: 'JetBrains Mono', monospace;
+        }
+        .status-dot {
+          width: 8px; height: 8px; border-radius: 999px; background: #E8A33D;
+          animation: pulse 2s infinite;
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .status-dot { animation: none; }
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.35; }
+        }
+        .spin { animation: spin 0.9s linear infinite; }
+        @media (prefers-reduced-motion: reduce) {
+          .spin { animation-duration: 0.01ms; }
+        }
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+
+        .grid {
+          max-width: 1180px;
+          margin: 0 auto;
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 20px;
+        }
+        @media (max-width: 900px) {
+          .grid { grid-template-columns: 1fr; }
+        }
+
+        .panel {
+          background: #fff;
+          border-radius: 14px;
+          border: 1px solid #DFE3E9;
+          padding: 22px;
+        }
+        .panel-title {
+          font-weight: 700;
+          font-size: 15px;
+          margin-bottom: 16px;
+          display: flex; align-items: center; gap: 8px;
+          color: #101B2D;
+        }
+
+        .panel-title-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          margin-bottom: 16px;
+        }
+        .panel-title-row .panel-title { margin-bottom: 0; }
+        .ai-parse-btn {
+          border: 1px solid #F3DBAE;
+          background: #FFF6E9;
+          color: #8A5A16;
+          font-size: 12.5px;
+          font-weight: 700;
+          padding: 7px 12px;
+          border-radius: 8px;
+          cursor: pointer;
+          display: flex; align-items: center; gap: 6px;
+          font-family: 'Noto Sans TC', sans-serif;
+        }
+        .ai-parse-btn:hover { background: #FFEFD3; }
+
+        textarea.ai-input {
+          width: 100%;
+          min-height: 160px;
+          border: 1px solid #DFE3E9;
+          border-radius: 10px;
+          padding: 12px 14px;
+          font-size: 14px;
+          font-family: 'Noto Sans TC', sans-serif;
+          resize: vertical;
+          background: #FBFBFC;
+        }
+        textarea.ai-input:focus {
+          outline: 2px solid #E8A33D;
+          outline-offset: 1px;
+        }
+
+        input.field:focus, select.field:focus, textarea.field:focus {
+          outline: 2px solid #E8A33D;
+          outline-offset: 1px;
+        }
+
+        .btn-primary {
+          margin-top: 14px;
+          width: 100%;
+          background: #101B2D;
+          color: #fff;
+          border: none;
+          padding: 12px 16px;
+          border-radius: 10px;
+          font-weight: 700;
+          font-size: 14px;
+          display: flex; align-items: center; justify-content: center; gap: 8px;
+          cursor: pointer;
+          font-family: 'Noto Sans TC', sans-serif;
+        }
+        .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+        .btn-primary.amber { background: #E8A33D; color: #101B2D; }
+
+        .error-box {
+          margin-top: 10px;
+          background: #FDEDEC;
+          color: #B3261E;
+          border: 1px solid #F5C6C3;
+          padding: 9px 12px;
+          border-radius: 8px;
+          font-size: 12.5px;
+          display: flex; gap: 6px; align-items: flex-start;
+        }
+
+        .edit-banner {
+          margin-top: 10px;
+          background: #EAF0FE;
+          color: #2F6FED;
+          border: 1px solid #C6D7FC;
+          padding: 9px 12px;
+          border-radius: 8px;
+          font-size: 12.5px;
+          font-weight: 600;
+          display: flex; gap: 6px; align-items: center;
+        }
+
+        .conflict-banner {
+          margin-top: 10px;
+          background: #FFF6E9;
+          color: #8A5A16;
+          border: 1px solid #F3DBAE;
+          padding: 10px 12px;
+          border-radius: 8px;
+          font-size: 12.5px;
+        }
+        .conflict-message {
+          display: flex; gap: 6px; align-items: flex-start;
+        }
+        .conflict-actions {
+          display: flex; gap: 8px; margin-top: 8px;
+        }
+        .conflict-btn {
+          border: 1px solid #DFE3E9;
+          background: #fff;
+          padding: 6px 12px;
+          border-radius: 7px;
+          font-size: 12px;
+          font-weight: 700;
+          cursor: pointer;
+          color: #5B6B84;
+        }
+        .conflict-btn.primary {
+          background: #E8A33D;
+          border-color: #E8A33D;
+          color: #101B2D;
+        }
+
+        .form-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 12px;
+        }
+        .form-grid .full { grid-column: 1 / -1; }
+        .section-heading {
+          font-size: 12px;
+          font-weight: 700;
+          color: #8A5A16;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+          padding-top: 10px;
+          margin-top: 4px;
+          border-top: 1px dashed #E4E7EC;
+        }
+        .form-grid > .section-heading:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+        .field-label {
+          font-size: 11.5px;
+          font-weight: 600;
+          color: #5B6B84;
+          margin-bottom: 5px;
+          display: block;
+        }
+        .field-warning {
+          font-size: 10.5px;
+          color: #B3261E;
+          margin-top: 4px;
+        }
+        .luggage-qty-grid {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          border: 1px solid #DFE3E9;
+          border-radius: 8px;
+          padding: 10px;
+          background: #FBFBFC;
+        }
+        .luggage-qty-chip {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 4px;
+          border: 1px solid #DFE3E9;
+          border-radius: 8px;
+          padding: 6px 8px;
+          background: #fff;
+          min-width: 68px;
+        }
+        .luggage-qty-chip.active {
+          border-color: #E8A33D;
+          background: #FFF8EC;
+        }
+        .luggage-qty-label {
+          font-size: 11.5px;
+          font-weight: 600;
+          color: #1B2436;
+        }
+        .luggage-qty-stepper {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 13px;
+          font-weight: 700;
+        }
+        .luggage-qty-stepper button {
+          width: 20px; height: 20px;
+          border-radius: 5px;
+          border: 1px solid #DFE3E9;
+          background: #fff;
+          color: #5B6B84;
+          cursor: pointer;
+          font-size: 13px;
+          line-height: 1;
+          display: flex; align-items: center; justify-content: center;
+        }
+        .luggage-qty-stepper button:disabled { opacity: 0.4; cursor: not-allowed; }
+        .luggage-qty-summary {
+          margin-top: 6px;
+          font-size: 11.5px;
+          color: #5B6B84;
+        }
+        input.field, select.field, textarea.field {
+          width: 100%;
+          border: 1px solid #DFE3E9;
+          border-radius: 8px;
+          padding: 9px 10px;
+          font-size: 13.5px;
+          font-family: 'Noto Sans TC', sans-serif;
+          background: #FBFBFC;
+        }
+        textarea.field { min-height: 60px; resize: vertical; }
+
+        .ticket-wrap {
+          position: relative;
+          border-radius: 14px;
+          overflow: hidden;
+          background: #fff;
+          border: 1px solid #DFE3E9;
+          display: flex;
+          min-height: 300px;
+        }
+        .ticket-stub {
+          width: 64px;
+          background: #101B2D;
+          position: relative;
+          flex-shrink: 0;
+          border-right: 2px dashed rgba(255,255,255,0.5);
+        }
+        .ticket-stub .num {
+          position: absolute; top: 16px; left: 50%;
+          transform: translateX(-50%);
+          writing-mode: vertical-rl;
+          color: #E8A33D;
+          font-weight: 700;
+          font-size: 13px;
+          letter-spacing: 1px;
+        }
+        .ticket-seal {
+          position: absolute; bottom: 16px; left: 50%;
+          transform: translateX(-50%);
+          width: 34px; height: 34px; border-radius: 999px;
+          background: #E8A33D;
+          color: #101B2D;
+          display: flex; align-items: center; justify-content: center;
+          font-weight: 700; font-size: 14px;
+        }
+        .ticket-body {
+          flex: 1;
+          padding: 20px 22px;
+        }
+        .ticket-empty {
+          flex: 1;
+          display: flex; flex-direction: column; align-items: center; justify-content: center;
+          color: #8993A4;
+          gap: 10px;
+          padding: 40px 20px;
+          text-align: center;
+          font-size: 13px;
+        }
+        .ticket-head {
+          display: flex; justify-content: space-between; align-items: baseline;
+          border-bottom: 1px solid #E4E7EC;
+          padding-bottom: 10px;
+          margin-bottom: 14px;
+        }
+        .ticket-head h3 { margin: 0; font-size: 20px; font-weight: 900; }
+        .ticket-head span { font-size: 10.5px; color: #5B6B84; letter-spacing: 1px; }
+        .status-row {
+          margin-bottom: 14px;
+          padding-bottom: 12px;
+          border-bottom: 1px solid #E4E7EC;
+        }
+        .status-pills {
+          display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;
+        }
+        .status-pill-btn {
+          border: 1px solid #DFE3E9;
+          background: #fff;
+          color: #5B6B84;
+          font-size: 11.5px;
+          font-weight: 700;
+          padding: 5px 10px;
+          border-radius: 999px;
+          cursor: pointer;
+        }
+        .status-pill-btn.active {
+          color: #fff;
+        }
+        .status-log {
+          margin-top: 10px;
+          padding-top: 8px;
+          border-top: 1px dashed #E4E7EC;
+        }
+        .status-log-row {
+          display: flex;
+          gap: 8px;
+          font-size: 11px;
+          color: #5B6B84;
+          padding: 2px 0;
+        }
+        .status-log-row .mono { color: #8993A4; flex-shrink: 0; }
+        .t-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+        .t-label { font-size: 10.5px; color: #5B6B84; font-weight: 600; margin-bottom: 3px; }
+        .t-val { font-size: 14.5px; font-weight: 600; color: #1B2436; }
+        .t-route { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 700; margin-bottom: 14px; flex-wrap: wrap; }
+        .t-route .arrow { color: #E8A33D; }
+        .t-notes { font-size: 13px; color: #3F4B5E; background: #F7F8FA; border-radius: 8px; padding: 10px 12px; margin-top: 4px; }
+
+        .export-row {
+          display: flex; gap: 10px; margin-top: 16px;
+        }
+        .export-btn {
+          flex: 1;
+          border: 1px solid #DFE3E9;
+          background: #fff;
+          padding: 10px;
+          border-radius: 9px;
+          font-size: 12.5px;
+          font-weight: 700;
+          display: flex; align-items: center; justify-content: center; gap: 6px;
+          cursor: pointer;
+          color: #101B2D;
+        }
+        .export-btn:hover { background: #F7F8FA; }
+        .export-btn.primary {
+          background: #E8A33D;
+          border-color: #E8A33D;
+          color: #101B2D;
+          font-size: 14px;
+          padding: 13px;
+        }
+        .export-btn.primary:hover { background: #d8952f; }
+        .export-hint {
+          font-size: 11.5px;
+          color: #8993A4;
+          margin-top: 8px;
+          text-align: center;
+        }
+
+        .export-modal-overlay {
+          position: fixed; inset: 0;
+          background: rgba(16, 27, 45, 0.7);
+          display: flex; align-items: center; justify-content: center;
+          padding: 20px;
+          z-index: 1000;
+        }
+        .export-modal {
+          background: #fff;
+          border-radius: 14px;
+          max-width: 640px;
+          width: 100%;
+          max-height: 90vh;
+          display: flex;
+          flex-direction: column;
+          overflow: hidden;
+        }
+        .export-modal-head {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 14px 16px;
+          border-bottom: 1px solid #EEF0F3;
+          font-family: 'JetBrains Mono', monospace;
+          font-weight: 700;
+          font-size: 13px;
+          color: #101B2D;
+        }
+        .export-modal-body {
+          overflow: auto;
+          padding: 16px;
+          background: #EEF0F3;
+        }
+        .export-modal-body img {
+          width: 100%;
+          height: auto;
+          border-radius: 8px;
+          display: block;
+        }
+        .export-modal .export-hint { padding: 0 16px; margin-top: 12px; }
+        .export-modal-link {
+          margin: 12px 16px 16px;
+          text-decoration: none;
+        }
+
+        .history-panel {
+          max-width: 1180px;
+          margin: 20px auto 0;
+          background: #fff;
+          border-radius: 14px;
+          border: 1px solid #DFE3E9;
+          padding: 22px;
+        }
+        .history-search {
+          margin-bottom: 12px;
+        }
+        .history-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 12px 6px;
+          border-bottom: 1px solid #EEF0F3;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+        .history-row:last-child { border-bottom: none; }
+        .history-left { display: flex; align-items: center; gap: 12px; min-width: 0; flex-wrap: wrap; }
+        .history-num {
+          font-family: 'JetBrains Mono', monospace;
+          font-weight: 700;
+          font-size: 13px;
+          background: #101B2D;
+          color: #E8A33D;
+          padding: 4px 8px;
+          border-radius: 6px;
+          flex-shrink: 0;
+        }
+        .history-status {
+          font-size: 10.5px;
+          font-weight: 700;
+          color: #fff;
+          padding: 3px 8px;
+          border-radius: 999px;
+          flex-shrink: 0;
+        }
+        .history-meta { font-size: 12.5px; color: #5B6B84; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .history-actions { display: flex; gap: 8px; }
+        .icon-btn {
+          border: 1px solid #DFE3E9; background: #fff; border-radius: 7px;
+          width: 30px; height: 30px; display: flex; align-items: center; justify-content: center;
+          cursor: pointer; color: #5B6B84;
+        }
+        .icon-btn:hover { background: #F7F8FA; color: #101B2D; }
+        .empty-history { text-align: center; color: #8993A4; font-size: 13px; padding: 20px 0; }
+      `}</style>
+
+      <div className="topbar">
+        <div className="brand">
+          <div className="brand-icon"><Car size={22} /></div>
+          <div>
+            <div className="brand-title">派車調度台</div>
+            <div className="brand-sub">CAR DISPATCH CONSOLE</div>
+          </div>
+        </div>
+        <div className="status-pill">
+          <span className="status-dot" />
+          系統運作中 · {history.length} 筆訂單
+        </div>
+      </div>
+
+      <div className="grid">
+        {/* LEFT: input panel */}
+        <div className="panel">
+          <div className="panel-title-row">
+            <div className="panel-title"><FileEdit size={16} /> 建立派車單</div>
+            <button className="ai-parse-btn" onClick={() => setAiDialogOpen(true)}>
+              <Sparkles size={14} /> AI解析
+            </button>
+          </div>
+
+          {pendingAIData && (
+            <div className="conflict-banner">
+              <div className="conflict-message">
+                <Sparkles size={14} />
+                <span>表單已有資料，AI 解析結果要如何套用？</span>
+              </div>
+              <div className="conflict-actions">
+                <button className="conflict-btn" onClick={() => setPendingAIData(null)}>保留原資料</button>
+                <button className="conflict-btn" onClick={() => applyAIData(pendingAIData, "fillEmptyOnly")}>僅更新空白欄位</button>
+                <button className="conflict-btn primary" onClick={() => applyAIData(pendingAIData, "overwrite")}>覆蓋所有欄位</button>
+              </div>
+            </div>
+          )}
+
+          <div>
+            <div className="form-grid">
+                {!editingOrderNumber && (
+                  <div className="full">
+                    <span className="field-label">訂單編號（選填，留空自動產生，格式如 DC-20260719-085839-F6GP）</span>
+                    <input
+                      className="field mono"
+                      value={form.customSeq}
+                      onChange={(e) => updateField("customSeq", e.target.value)}
+                      placeholder="留空則自動產生"
+                    />
+                  </div>
+                )}
+
+                <div className="full section-heading">客戶資訊</div>
+                <div>
+                  <span className="field-label">客戶姓名 *</span>
+                  <input className="field" style={lowConfidenceStyle("customerName")} value={form.customerName} onChange={(e) => updateField("customerName", e.target.value)} placeholder="王小明" />
+                </div>
+                <div>
+                  <span className="field-label">聯絡電話 *</span>
+                  <input className="field" style={lowConfidenceStyle("phone")} value={form.phone} onChange={(e) => updateField("phone", e.target.value)} placeholder="0912-345-678" />
+                </div>
+
+                <div className="full section-heading">行程資訊</div>
+                <div>
+                  <span className="field-label">上車地點 *</span>
+                  <select
+                    className="field"
+                    value=""
+                    onChange={(e) => { if (e.target.value) updateField("pickup", e.target.value); }}
+                    style={{ marginBottom: 6 }}
+                  >
+                    <option value="">從機場／航廈快速選擇…</option>
+                    {AIRPORT_OPTIONS.map((a) => (
+                      <option key={a} value={a}>{a}</option>
+                    ))}
+                  </select>
+                  <input className="field" style={lowConfidenceStyle("pickup")} value={form.pickup} onChange={(e) => updateField("pickup", e.target.value)} placeholder="台北車站" />
+                </div>
+                <div>
+                  <span className="field-label">中途停靠</span>
+                  <select
+                    className="field"
+                    value=""
+                    onChange={(e) => { if (e.target.value) updateField("waypoint", e.target.value); }}
+                    style={{ marginBottom: 6 }}
+                  >
+                    <option value="">從機場／航廈快速選擇…</option>
+                    {AIRPORT_OPTIONS.map((a) => (
+                      <option key={a} value={a}>{a}</option>
+                    ))}
+                  </select>
+                  <input className="field" style={lowConfidenceStyle("waypoint")} value={form.waypoint} onChange={(e) => updateField("waypoint", e.target.value)} placeholder="（選填）" />
+                </div>
+                <div>
+                  <span className="field-label">下車地點 *</span>
+                  <select
+                    className="field"
+                    value=""
+                    onChange={(e) => { if (e.target.value) updateField("dropoff", e.target.value); }}
+                    style={{ marginBottom: 6 }}
+                  >
+                    <option value="">從機場／航廈快速選擇…</option>
+                    {AIRPORT_OPTIONS.map((a) => (
+                      <option key={a} value={a}>{a}</option>
+                    ))}
+                  </select>
+                  <input className="field" style={lowConfidenceStyle("dropoff")} value={form.dropoff} onChange={(e) => updateField("dropoff", e.target.value)} placeholder="桃園機場第二航廈" />
+                </div>
+                <div>
+                  <span className="field-label">用車日期 *</span>
+                  <input className="field" style={lowConfidenceStyle("date")} type="date" value={form.date} onChange={(e) => updateField("date", e.target.value)} />
+                  {isPastDate(form.date) && (
+                    <div className="field-warning">⚠ 此日期早於今天，請確認</div>
+                  )}
+                </div>
+                <div>
+                  <span className="field-label">用車時間 *</span>
+                  <input className="field" style={lowConfidenceStyle("time")} type="time" value={form.time} onChange={(e) => updateField("time", e.target.value)} />
+                </div>
+                <div>
+                  <span className="field-label">航班編號</span>
+                  <input className="field" style={lowConfidenceStyle("flightNo")} value={form.flightNo} onChange={(e) => updateField("flightNo", e.target.value)} placeholder="CI123" />
+                </div>
+                <div>
+                  <span className="field-label">搭乘人數</span>
+                  <input className="field" style={lowConfidenceStyle("passengers")} type="number" min="1" value={form.passengers} onChange={(e) => updateField("passengers", e.target.value)} placeholder="3" />
+                </div>
+
+                <div className="full section-heading">行李與其他需求</div>
+                <div>
+                  <span className="field-label">行李數量</span>
+                  <select className="field" style={lowConfidenceStyle("luggageCount")} value={form.luggageCount} onChange={(e) => updateField("luggageCount", e.target.value)}>
+                    {QTY_OPTIONS.map((v) => (
+                      <option key={v} value={v}>{v === "" ? "未指定" : `${v} 件`}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="full">
+                  <span className="field-label">行李尺寸（可複選並設定各尺寸數量）</span>
+                  <div className="luggage-qty-grid" style={lowConfidenceStyle("luggageSize")}>
+                    {LUGGAGE_SIZES.map((size) => {
+                      const qty = parseLuggageSizeString(form.luggageSize)[size] || 0;
+                      return (
+                        <div key={size} className={"luggage-qty-chip" + (qty > 0 ? " active" : "")}>
+                          <span className="luggage-qty-label">{size}</span>
+                          <div className="luggage-qty-stepper">
+                            <button type="button" onClick={() => updateLuggageSizeQty(size, -1)} disabled={qty === 0}>−</button>
+                            <span>{qty}</span>
+                            <button type="button" onClick={() => updateLuggageSizeQty(size, 1)}>＋</button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {form.luggageSize && (
+                    <div className="luggage-qty-summary">已選：{form.luggageSize}</div>
+                  )}
+                </div>
+                <div>
+                  <span className="field-label">增高墊</span>
+                  <select className="field" style={lowConfidenceStyle("boosterSeat")} value={form.boosterSeat} onChange={(e) => updateField("boosterSeat", e.target.value)}>
+                    {QTY_OPTIONS.map((v) => (
+                      <option key={v} value={v}>{v === "" ? "未指定" : `${v} 個`}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <span className="field-label">安全椅</span>
+                  <select className="field" style={lowConfidenceStyle("childSeat")} value={form.childSeat} onChange={(e) => updateField("childSeat", e.target.value)}>
+                    {QTY_OPTIONS.map((v) => (
+                      <option key={v} value={v}>{v === "" ? "未指定" : `${v} 個`}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <span className="field-label">收據</span>
+                  <select className="field" style={lowConfidenceStyle("receipt")} value={form.receipt} onChange={(e) => updateField("receipt", e.target.value)}>
+                    {QTY_OPTIONS.map((v) => (
+                      <option key={v} value={v}>{v === "" ? "未指定" : `${v} 份`}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <span className="field-label">費用</span>
+                  <input className="field mono" style={lowConfidenceStyle("price")} type="number" min="0" value={form.price} onChange={(e) => updateField("price", e.target.value)} placeholder="NT$" />
+                </div>
+
+                <div className="full section-heading">車輛與司機資訊</div>
+                <div>
+                  <span className="field-label">司機姓名</span>
+                  <input className="field" style={lowConfidenceStyle("driver")} value={form.driver} onChange={(e) => updateField("driver", e.target.value)} placeholder="待指派" />
+                </div>
+                <div>
+                  <span className="field-label">司機電話</span>
+                  <input className="field" style={lowConfidenceStyle("driverPhone")} value={form.driverPhone} onChange={(e) => updateField("driverPhone", e.target.value)} placeholder="待指派" />
+                </div>
+                <div>
+                  <span className="field-label">車型</span>
+                  <select className="field" style={lowConfidenceStyle("carType")} value={form.carType} onChange={(e) => updateField("carType", e.target.value)}>
+                    <option value="">請選擇</option>
+                    {CAR_TYPES.map((t) => (
+                      <option key={t} value={t}>{t}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <span className="field-label">車款</span>
+                  <select
+                    className="field"
+                    value=""
+                    onChange={(e) => {
+                      if (e.target.value) updateField("carModel", e.target.value);
+                    }}
+                    style={{ marginBottom: 6 }}
+                  >
+                    <option value="">從常用清單快速選擇…</option>
+                    {CAR_MODELS.map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                  <input className="field" style={lowConfidenceStyle("carModel")} value={form.carModel} onChange={(e) => updateField("carModel", e.target.value)} placeholder="或直接輸入車款，例如 Toyota Alphard" />
+                </div>
+                <div>
+                  <span className="field-label">車號</span>
+                  <input className="field" style={lowConfidenceStyle("plate")} value={form.plate} onChange={(e) => updateField("plate", e.target.value)} placeholder="待指派" />
+                  {!isLikelyValidPlate(form.plate) && (
+                    <div className="field-warning">⚠ 車牌格式看起來不太對，請確認</div>
+                  )}
+                </div>
+                <div>
+                  <span className="field-label">車色</span>
+                  <select
+                    className="field"
+                    value=""
+                    onChange={(e) => { if (e.target.value) updateField("carColor", e.target.value); }}
+                    style={{ marginBottom: 6 }}
+                  >
+                    <option value="">從常用顏色快速選擇…</option>
+                    {CAR_COLORS.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                  <input className="field" style={lowConfidenceStyle("carColor")} value={form.carColor} onChange={(e) => updateField("carColor", e.target.value)} placeholder="或直接輸入車色" />
+                </div>
+
+                <div className="full">
+                  <span className="field-label">備註</span>
+                  <textarea className="field" style={lowConfidenceStyle("notes")} value={form.notes} onChange={(e) => updateField("notes", e.target.value)} placeholder="嬰兒推車、特殊需求等" />
+                </div>
+              </div>
+
+              {formError && (
+                <div className="error-box"><AlertCircle size={14} />{formError}</div>
+              )}
+
+              {editingOrderNumber && (
+                <div className="edit-banner">
+                  <FileEdit size={14} /> 正在編輯訂單 <span className="mono">{editingOrderNumber}</span>
+                </div>
+              )}
+
+              {conflictInfo && (
+                <div className="conflict-banner">
+                  <div className="conflict-message">
+                    <AlertCircle size={14} />
+                    <span>
+                      同司機／同車牌在 {form.date} {form.time} 已有其他派工（
+                      <span className="mono">{conflictInfo.orderNumbers.join("、")}</span>
+                      ），確定仍要送出嗎？
+                    </span>
+                  </div>
+                  <div className="conflict-actions">
+                    <button className="conflict-btn" onClick={() => setConflictInfo(null)}>取消</button>
+                    <button className="conflict-btn primary" onClick={() => handleSubmitOrder(true)}>仍要送出</button>
+                  </div>
+                </div>
+              )}
+
+              <button className="btn-primary amber" onClick={() => handleSubmitOrder(false)}>
+                <CheckCircle2 size={16} />
+                {editingOrderNumber ? "更新派車單" : "產生派車單並取得訂單編號"}
+              </button>
+              {editingOrderNumber ? (
+                <button
+                  className="btn-primary"
+                  style={{ background: "#fff", color: "#5B6B84", border: "1px solid #DFE3E9", marginTop: 8 }}
+                  onClick={handleCancelEdit}
+                >
+                  取消編輯
+                </button>
+              ) : (
+                <button
+                  className="btn-primary"
+                  style={{ background: "#fff", color: "#5B6B84", border: "1px solid #DFE3E9", marginTop: 8 }}
+                  onClick={resetForm}
+                >
+                  清空重填
+                </button>
+              )}
+            </div>
+        </div>
+
+        {/* RIGHT: ticket preview */}
+        <div className="panel">
+          <div className="panel-title"><ImageIcon size={16} /> 派車單預覽</div>
+
+          <div className="ticket-wrap" ref={previewRef}>
+            <div className="ticket-stub">
+              {previewOrder && <div className="num">{previewOrder.orderNumber}</div>}
+              {previewOrder && <div className="ticket-seal">派</div>}
+            </div>
+            {previewOrder ? (
+              <div className="ticket-body">
+                <div className="ticket-head">
+                  <h3>接送派車單</h3>
+                  <span className="mono">DISPATCH ORDER</span>
+                </div>
+                <div className="status-row">
+                  <span className="t-label">訂單狀態</span>
+                  <div className="status-pills">
+                    {STATUS_OPTIONS.map((s) => (
+                      <button
+                        key={s}
+                        className={"status-pill-btn" + ((previewOrder.status || "待確認") === s ? " active" : "")}
+                        style={(previewOrder.status || "待確認") === s ? { background: STATUS_META[s].color, borderColor: STATUS_META[s].color } : {}}
+                        onClick={() => updateOrderStatus(previewOrder.orderNumber, s)}
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                  {Array.isArray(previewOrder.statusLog) && previewOrder.statusLog.length > 0 && (
+                    <div className="status-log">
+                      {previewOrder.statusLog.slice().reverse().map((entry, i) => (
+                        <div key={i} className="status-log-row">
+                          <span className="mono">{fmtDateTime(entry.at)}</span>
+                          <span>{entry.note || entry.status}{entry.driver ? `（${entry.driver}）` : ""}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="t-row">
+                  <div>
+                    <div className="t-label">客戶姓名</div>
+                    <div className="t-val">{previewOrder.customerName || "-"}</div>
+                  </div>
+                  <div>
+                    <div className="t-label">聯絡電話</div>
+                    <div className="t-val mono">{previewOrder.phone || "-"}</div>
+                  </div>
+                </div>
+                <div>
+                  <div className="t-label">行程</div>
+                  <div className="t-route">
+                    <span>{previewOrder.pickup || "-"}</span>
+                    {previewOrder.waypoint && (
+                      <>
+                        <span className="arrow">→</span>
+                        <span>{previewOrder.waypoint}</span>
+                      </>
+                    )}
+                    <span className="arrow">→</span>
+                    <span>{previewOrder.dropoff || "-"}</span>
+                  </div>
+                </div>
+                <div className="t-row">
+                  <div>
+                    <div className="t-label">用車日期</div>
+                    <div className="t-val mono">{previewOrder.date || "-"}</div>
+                  </div>
+                  <div>
+                    <div className="t-label">用車時間</div>
+                    <div className="t-val mono">{previewOrder.time || "-"}</div>
+                  </div>
+                </div>
+                <div className="t-row">
+                  <div>
+                    <div className="t-label">航班編號</div>
+                    <div className="t-val mono">{previewOrder.flightNo || "-"}</div>
+                  </div>
+                  <div>
+                    <div className="t-label">搭乘人數</div>
+                    <div className="t-val">{previewOrder.passengers ? `${previewOrder.passengers} 人` : "-"}</div>
+                  </div>
+                </div>
+                <div className="t-row">
+                  <div>
+                    <div className="t-label">行李數量</div>
+                    <div className="t-val">{previewOrder.luggageCount && previewOrder.luggageCount !== "0" ? `${previewOrder.luggageCount} 件` : "-"}</div>
+                  </div>
+                  <div>
+                    <div className="t-label">行李尺寸</div>
+                    <div className="t-val">{previewOrder.luggageSize || "-"}</div>
+                  </div>
+                </div>
+                <div className="t-row">
+                  <div>
+                    <div className="t-label">增高墊</div>
+                    <div className="t-val">{previewOrder.boosterSeat && previewOrder.boosterSeat !== "0" ? `${previewOrder.boosterSeat} 個` : "-"}</div>
+                  </div>
+                  <div>
+                    <div className="t-label">安全椅</div>
+                    <div className="t-val">{previewOrder.childSeat && previewOrder.childSeat !== "0" ? `${previewOrder.childSeat} 個` : "-"}</div>
+                  </div>
+                </div>
+                <div className="t-row">
+                  <div>
+                    <div className="t-label">收據</div>
+                    <div className="t-val">{previewOrder.receipt && previewOrder.receipt !== "0" ? `${previewOrder.receipt} 份` : "-"}</div>
+                  </div>
+                  <div>
+                    <div className="t-label">費用</div>
+                    <div className="t-val mono">{previewOrder.price ? `NT$ ${previewOrder.price}` : "-"}</div>
+                  </div>
+                </div>
+                <div className="t-row">
+                  <div>
+                    <div className="t-label">司機</div>
+                    <div className="t-val">{previewOrder.driver || "待指派"}</div>
+                  </div>
+                  <div>
+                    <div className="t-label">司機電話</div>
+                    <div className="t-val mono">{previewOrder.driverPhone || "-"}</div>
+                  </div>
+                </div>
+                <div className="t-row">
+                  <div>
+                    <div className="t-label">車型</div>
+                    <div className="t-val">{previewOrder.carType || "-"}</div>
+                  </div>
+                  <div>
+                    <div className="t-label">車款</div>
+                    <div className="t-val">{previewOrder.carModel || "-"}</div>
+                  </div>
+                </div>
+                <div className="t-row">
+                  <div>
+                    <div className="t-label">車號</div>
+                    <div className="t-val mono">{previewOrder.plate || "待指派"}</div>
+                  </div>
+                  <div>
+                    <div className="t-label">車色</div>
+                    <div className="t-val">{previewOrder.carColor || "-"}</div>
+                  </div>
+                </div>
+                {previewOrder.notes && (
+                  <div>
+                    <div className="t-label">備註</div>
+                    <div className="t-notes">{previewOrder.notes}</div>
+                  </div>
+                )}
+
+                <div className="export-row">
+                  <button className="export-btn primary" onClick={() => handleExport(previewOrder)} disabled={exportLoading}>
+                    {exportLoading ? <Loader2 size={14} className="spin" /> : <Download size={14} />}
+                    {exportLoading ? "產生圖片中…" : "一鍵匯出"}
+                  </button>
+                </div>
+                {exportError && (
+                  <div className="error-box" style={{ marginTop: 10 }}>
+                    <AlertCircle size={14} />{exportError}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="ticket-empty">
+                <Car size={28} />
+                <div>尚未產生派車單<br />請於左側輸入客戶資訊並送出</div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* HISTORY */}
+      <div className="history-panel">
+        <div className="panel-title"><History size={16} /> 歷史派車紀錄</div>
+        {dataLoaded && history.length > 0 && (
+          <input
+            className="field history-search"
+            placeholder="搜尋姓名、電話、司機、車牌、日期或訂單編號…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        )}
+        {!dataLoaded ? (
+          <div className="empty-history">載入中…</div>
+        ) : history.length === 0 ? (
+          <div className="empty-history">目前尚無派車紀錄</div>
+        ) : filteredHistory.length === 0 ? (
+          <div className="empty-history">找不到符合「{searchQuery}」的訂單</div>
+        ) : (
+          filteredHistory.map((o) => {
+            const statusMeta = STATUS_META[o.status || "待確認"] || STATUS_META["待確認"];
+            return (
+              <div className="history-row" key={o.orderNumber}>
+                <div className="history-left">
+                  <span className="history-num">{o.orderNumber}</span>
+                  <span className="history-status" style={{ background: statusMeta.color }}>
+                    {o.status || "待確認"}
+                  </span>
+                  <span className="history-meta">
+                    {o.customerName} · {o.pickup} → {o.dropoff} · {o.date} {o.time}
+                  </span>
+                </div>
+                <div className="history-actions">
+                  <button className="icon-btn" title="查看" onClick={() => setCurrentOrder(o)}>
+                    <ChevronRight size={15} />
+                  </button>
+                  <button className="icon-btn" title="編輯" onClick={() => handleEditOrder(o)}>
+                    <FileEdit size={15} />
+                  </button>
+                  <button className="icon-btn" title="一鍵匯出" onClick={() => handleExport(o)}>
+                    <Download size={15} />
+                  </button>
+                  <button className="icon-btn" title="刪除" onClick={() => handleDeleteHistory(o.orderNumber)}>
+                    <Trash2 size={15} />
+                  </button>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {aiDialogOpen && (
+        <div className="export-modal-overlay" onClick={closeAIDialog}>
+          <div className="export-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="export-modal-head">
+              <span><Sparkles size={14} style={{ verticalAlign: "-2px", marginRight: 6 }} />AI 智慧解析</span>
+              <button className="icon-btn" onClick={closeAIDialog}><X size={16} /></button>
+            </div>
+            <div style={{ padding: 16 }}>
+              <textarea
+                className="ai-input"
+                placeholder="請貼上客人的訊息（LINE、WhatsApp、Email、微信皆可），例如：&#10;王小明 0912345678 明天早上9點半要從台北車站到桃園機場第二航廈，3個人，5件行李，需要商務車"
+                value={aiText}
+                onChange={(e) => setAiText(e.target.value)}
+                disabled={aiLoading}
+              />
+              {aiError && (
+                <div className="error-box" style={{ marginTop: 10 }}><AlertCircle size={14} />{aiError}</div>
+              )}
+              {aiDebug && (
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ fontSize: 11.5, fontWeight: 600, color: "#5B6B84", marginBottom: 5 }}>
+                    除錯資訊（請長按選取全部文字後複製貼給我）
+                  </div>
+                  <textarea
+                    readOnly
+                    className="ai-input mono"
+                    style={{ minHeight: 140, fontSize: 11.5, background: "#F7F8FA" }}
+                    value={aiDebug}
+                    onFocus={(e) => e.target.select()}
+                  />
+                </div>
+              )}
+              <div className="conflict-actions" style={{ marginTop: 14 }}>
+                <button className="conflict-btn" onClick={closeAIDialog} disabled={aiLoading}>取消</button>
+                <button className="conflict-btn primary" onClick={handleAIParse} disabled={aiLoading || !aiText.trim()}>
+                  {aiLoading ? "AI解析中…" : "解析"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {exportImage && (
+        <div className="export-modal-overlay" onClick={() => setExportImage(null)}>
+          <div className="export-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="export-modal-head">
+              <span>{exportImage.orderNumber}.png</span>
+              <button className="icon-btn" onClick={() => setExportImage(null)}><X size={16} /></button>
+            </div>
+            <div className="export-modal-body">
+              <img src={exportImage.url} alt={`派車單 ${exportImage.orderNumber}`} />
+            </div>
+            <p className="export-hint">
+              點下方「儲存圖片」；若手機沒反應，請直接長按圖片選擇「儲存圖片」
+            </p>
+            <button className="export-btn primary export-modal-link" onClick={handleSaveImage}>
+              <Download size={14} /> 儲存圖片
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<DispatchOrderApp />);
+</script>
+</body>
+</html>
